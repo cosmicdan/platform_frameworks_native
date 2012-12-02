@@ -43,6 +43,10 @@
 #include "SurfaceFlinger.h"
 #include "SurfaceTextureLayer.h"
 
+#ifdef QCOM_HARDWARE
+#include <gpuformats.h>
+#endif
+
 #define DEBUG_RESIZE    0
 
 namespace android {
@@ -210,10 +214,20 @@ status_t Layer::setBuffers( uint32_t w, uint32_t h,
     mSurfaceTexture->setDefaultBufferFormat(format);
     mSurfaceTexture->setConsumerUsageBits(getEffectiveUsage(0));
 
-    // we use the red index
-    int displayRedSize = displayInfo.getSize(PixelFormatInfo::INDEX_RED);
-    int layerRedsize = info.getSize(PixelFormatInfo::INDEX_RED);
-    mNeedsDithering = layerRedsize > displayRedSize;
+    int useDither = mFlinger->getUseDithering();
+    if (useDither) {
+        if (useDither == 2) {
+            mNeedsDithering = true;
+        }
+        else {
+            // we use the red index
+            int displayRedSize = displayInfo.getSize(PixelFormatInfo::INDEX_RED);
+            int layerRedsize = info.getSize(PixelFormatInfo::INDEX_RED);
+            mNeedsDithering = (layerRedsize > displayRedSize);
+        }
+    } else {
+        mNeedsDithering = false;
+    }
 
     return NO_ERROR;
 }
@@ -281,6 +295,9 @@ void Layer::setGeometry(hwc_layer_t* hwcl)
      */
 
     const Transform bufferOrientation(mCurrentTransform);
+#ifdef QCOM_HARDWARE
+    hwcl->sourceTransform = bufferOrientation.getOrientation();
+#endif
     const Transform tr(mTransform * bufferOrientation);
 
     // this gives us only the "orientation" component of the transform
@@ -344,7 +361,12 @@ void Layer::onDraw(const Region& clip) const
         }
         return;
     }
-
+#ifdef QCOM_HARDWARE
+    if (!qdutils::isGPUSupportedFormat(mActiveBuffer->format)) {
+        clearWithOpenGL(clip, 0, 0, 0, 1);
+        return;
+    }
+#endif
     if (!isProtected()) {
         // TODO: we could be more subtle with isFixedSize()
         const bool useFiltering = getFiltering() || needsFiltering() || isFixedSize();

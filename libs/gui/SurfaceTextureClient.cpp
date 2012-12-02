@@ -29,6 +29,9 @@
 #include <gui/SurfaceTextureClient.h>
 
 #include <private/gui/ComposerService.h>
+#ifdef QCOM_HARDWARE
+#include <gralloc_priv.h>
+#endif
 
 namespace android {
 
@@ -74,6 +77,7 @@ void SurfaceTextureClient::init() {
     mReqHeight = 0;
     mReqFormat = 0;
     mReqUsage = 0;
+    mReqExtUsage = 0;
     mTimestamp = NATIVE_WINDOW_TIMESTAMP_AUTO;
     mCrop.clear();
     mScalingMode = NATIVE_WINDOW_SCALING_MODE_FREEZE;
@@ -345,6 +349,14 @@ int SurfaceTextureClient::perform(int operation, va_list args)
     case NATIVE_WINDOW_SET_BUFFERS_FORMAT:
         res = dispatchSetBuffersFormat(args);
         break;
+#ifdef QCOM_HARDWARE
+    case NATIVE_WINDOW_SET_BUFFERS_SIZE:
+        res = dispatchSetBuffersSize(args);
+        break;
+    case NATIVE_WINDOW_UPDATE_BUFFERS_GEOMETRY:
+        res = dispatchUpdateBuffersGeometry(args);
+        break;
+#endif
     case NATIVE_WINDOW_LOCK:
         res = dispatchLock(args);
         break;
@@ -420,6 +432,20 @@ int SurfaceTextureClient::dispatchSetBuffersFormat(va_list args) {
     return setBuffersFormat(f);
 }
 
+#ifdef QCOM_HARDWARE
+int SurfaceTextureClient::dispatchSetBuffersSize(va_list args) {
+    int size = va_arg(args, int);
+    return setBuffersSize(size);
+}
+
+int SurfaceTextureClient::dispatchUpdateBuffersGeometry(va_list args) {
+    int w = va_arg(args, int);
+    int h = va_arg(args, int);
+    int f = va_arg(args, int);
+    return updateBuffersGeometry(w, h, f);
+}
+#endif
+
 int SurfaceTextureClient::dispatchSetScalingMode(va_list args) {
     int m = va_arg(args, int);
     return setScalingMode(m);
@@ -489,7 +515,27 @@ int SurfaceTextureClient::setUsage(uint32_t reqUsage)
 {
     ALOGV("SurfaceTextureClient::setUsage");
     Mutex::Autolock lock(mMutex);
-    mReqUsage = reqUsage;
+
+#ifdef QCOM_HARDWARE
+    if (reqUsage & GRALLOC_USAGE_PRIVATE_EXTERNAL_ONLY) {
+        //Set explicitly, since reqUsage may have other values.
+        mReqExtUsage = GRALLOC_USAGE_PRIVATE_EXTERNAL_ONLY;
+        //This flag is never independent. Always an add-on to
+        //GRALLOC_USAGE_EXTERNAL_ONLY
+        if(reqUsage & GRALLOC_USAGE_PRIVATE_EXTERNAL_BLOCK) {
+            mReqExtUsage |= GRALLOC_USAGE_PRIVATE_EXTERNAL_BLOCK;
+        } else if(reqUsage & GRALLOC_USAGE_PRIVATE_EXTERNAL_CC) {
+            mReqExtUsage |= GRALLOC_USAGE_PRIVATE_EXTERNAL_CC;
+        }
+    }
+#endif
+
+    // For most cases mReqExtUsage will be 0.
+    // reqUsage could come from app or driver. When it comes from app
+    // and subsequently from driver, the latter ends up overwriting
+    // the existing values. We cache certain values in mReqExtUsage
+    // to avoid being overwritten.
+    mReqUsage = reqUsage | mReqExtUsage;
     return OK;
 }
 
@@ -574,6 +620,37 @@ int SurfaceTextureClient::setBuffersFormat(int format)
     mReqFormat = format;
     return NO_ERROR;
 }
+
+#ifdef QCOM_HARDWARE
+int SurfaceTextureClient::setBuffersSize(int size)
+{
+    ATRACE_CALL();
+    ALOGV("SurfaceTextureClient::setBuffersSize");
+
+    if (size<0)
+        return BAD_VALUE;
+
+    Mutex::Autolock lock(mMutex);
+    status_t err = mSurfaceTexture->setBuffersSize(size);
+    return NO_ERROR;
+}
+
+int SurfaceTextureClient::updateBuffersGeometry(int w, int h, int f)
+{
+    ATRACE_CALL();
+    ALOGV("SurfaceTextureClient::updateBuffersGeometry");
+
+    if (w<0 || h<0 || f<0)
+        return BAD_VALUE;
+
+    if ((w && !h) || (!w && h))
+        return BAD_VALUE;
+
+    Mutex::Autolock lock(mMutex);
+    status_t err = mSurfaceTexture->updateBuffersGeometry(w, h, f);
+    return NO_ERROR;
+}
+#endif
 
 int SurfaceTextureClient::setScalingMode(int mode)
 {
@@ -717,16 +794,31 @@ status_t SurfaceTextureClient::lock(
                     backBuffer->height == frontBuffer->height &&
                     backBuffer->format == frontBuffer->format);
 
+#ifdef QCOM_HARDWARE
+            int backBufferSlot(getSlotFromBufferLocked(backBuffer.get()));
+#endif
             if (canCopyBack) {
                 // copy the area that is invalid and not repainted this round
+#ifdef QCOM_HARDWARE
+                Mutex::Autolock lock(mMutex);
+                Region oldDirtyRegion;
+                for(int i = 0 ; i < NUM_BUFFER_SLOTS; i++ ) {
+                     if(i != backBufferSlot && !mSlots[i].dirtyRegion.isEmpty())
+                         oldDirtyRegion.orSelf(mSlots[i].dirtyRegion);
+                }
+                const Region copyback(oldDirtyRegion.subtract(newDirtyRegion));
+#else
                 const Region copyback(mDirtyRegion.subtract(newDirtyRegion));
+#endif
                 if (!copyback.isEmpty())
                     copyBlt(backBuffer, frontBuffer, copyback);
             } else {
                 // if we can't copy-back anything, modify the user's dirty
                 // region to make sure they redraw the whole buffer
                 newDirtyRegion.set(bounds);
+#ifndef QCOM_HARDWARE
                 mDirtyRegion.clear();
+#endif
                 Mutex::Autolock lock(mMutex);
                 for (size_t i=0 ; i<NUM_BUFFER_SLOTS ; i++) {
                     mSlots[i].dirtyRegion.clear();
@@ -736,15 +828,22 @@ status_t SurfaceTextureClient::lock(
 
             { // scope for the lock
                 Mutex::Autolock lock(mMutex);
+#ifdef QCOM_HARDWARE
+                mSlots[backBufferSlot].dirtyRegion = newDirtyRegion;
+#else
                 int backBufferSlot(getSlotFromBufferLocked(backBuffer.get()));
                 if (backBufferSlot >= 0) {
                     Region& dirtyRegion(mSlots[backBufferSlot].dirtyRegion);
                     mDirtyRegion.subtract(dirtyRegion);
                     dirtyRegion = newDirtyRegion;
                 }
+#endif
             }
 
-            mDirtyRegion.orSelf(newDirtyRegion);
+#ifndef QCOM_HARDWARE
+           mDirtyRegion.orSelf(newDirtyRegion);
+#endif
+
             if (inOutDirtyBounds) {
                 *inOutDirtyBounds = newDirtyRegion.getBounds();
             }
@@ -757,12 +856,16 @@ status_t SurfaceTextureClient::lock(
             ALOGW_IF(res, "failed locking buffer (handle = %p)",
                     backBuffer->handle);
 
-            mLockedBuffer = backBuffer;
-            outBuffer->width  = backBuffer->width;
-            outBuffer->height = backBuffer->height;
-            outBuffer->stride = backBuffer->stride;
-            outBuffer->format = backBuffer->format;
-            outBuffer->bits   = vaddr;
+            if (res != 0) {
+                err = INVALID_OPERATION;
+            } else {
+                mLockedBuffer = backBuffer;
+                outBuffer->width  = backBuffer->width;
+                outBuffer->height = backBuffer->height;
+                outBuffer->stride = backBuffer->stride;
+                outBuffer->format = backBuffer->format;
+                outBuffer->bits   = vaddr;
+            }
         }
     }
     return err;
